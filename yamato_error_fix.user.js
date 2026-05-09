@@ -25,8 +25,8 @@
         waitForTimeout:   2500,  // waitFor の最大待機時間
         waitForPoll:       300,  // waitFor のポーリング間隔
         beforeUpdate:      600,  // 更新ボタンクリック前の待機
-        afterUpdate:      1500,  // 更新ボタンクリック後の待機（confirm + alert を自動OK する余裕）
-        afterClose:       1500,  // 閉じるボタンクリック後の待機
+        afterUpdate:      800,  // 更新ボタンクリック後の待機（confirm + alert を自動OK する余裕）
+        afterClose:       600,  // 閉じるボタンクリック後の待機
         afterCloseExtra:   600,  // tryClose 完了後の追加待機
         scrollReset:       400,  // スクロールリセット後の待機
         scrollStep:        350,  // スクロール1ステップ後の待機
@@ -136,7 +136,6 @@
     }
 
     function sleepLog(label, ms) {
-        console.log(`[YamatoFix] ⏱ 待機: ${label} ${ms}ms`);
         return sleep(ms);
     }
 
@@ -155,7 +154,6 @@
                     if (!doc) continue;
                     const el = doc.querySelector(selector);
                     if (el) {
-                        console.log('[YamatoFix] iframe 内で要素を検出:', selector);
                         return el;
                     }
                 } catch (e) {
@@ -207,11 +205,11 @@
             const oc = win.confirm.bind(win);
             const oa = win.alert.bind(win);
             win.confirm = (...a) => {
-                if (autoOK) { console.log('[YamatoFix] confirm → OK:', ...a); return true; }
+                if (autoOK) return true;
                 return oc(...a);
             };
             win.alert = (...a) => {
-                if (autoOK) { console.log('[YamatoFix] alert → OK:', ...a); return; }
+                if (autoOK) return;
                 return oa(...a);
             };
         } catch (e) { /* cross-origin は無視 */ }
@@ -331,8 +329,9 @@
         await sleepLog('afterUpdate', TIMING.afterUpdate);
         autoOK = false;
 
-        // 更新後もモーダルが残っていれば更新失敗と判断 → throw してスキップ処理へ
-        if (mDoc.getElementById('Edit')) {
+        // 更新後もモーダルの iframe が DOM に残っていれば更新失敗と判断 → throw してスキップ処理へ
+        const frameEl = mDoc.defaultView?.frameElement;
+        if (frameEl && document.body.contains(frameEl)) {
             throw new Error('更新後もモーダルが閉じませんでした（サーバーエラーまたは入力不備）');
         }
     }
