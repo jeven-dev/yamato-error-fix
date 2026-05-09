@@ -22,15 +22,15 @@
 
     // ── タイミング設定（ms）──
     const TIMING = {
-        waitForTimeout:  15000,  // waitFor の最大待機時間
+        waitForTimeout:   2500,  // waitFor の最大待機時間
         waitForPoll:       300,  // waitFor のポーリング間隔
         beforeUpdate:      600,  // 更新ボタンクリック前の待機
-        afterUpdate:      3500,  // 更新ボタンクリック後の待機（confirm + alert を自動OK する余裕）
+        afterUpdate:      1500,  // 更新ボタンクリック後の待機（confirm + alert を自動OK する余裕）
         afterClose:       1500,  // 閉じるボタンクリック後の待機
         afterCloseExtra:   600,  // tryClose 完了後の追加待機
         scrollReset:       400,  // スクロールリセット後の待機
         scrollStep:        350,  // スクロール1ステップ後の待機
-        afterRow:         1200,  // 1行処理完了後の待機
+        afterRow:          800,  // 1行処理完了後の待機
     };
 
     // ── スクロール設定 ──
@@ -135,6 +135,11 @@
         return new Promise(r => setTimeout(r, ms));
     }
 
+    function sleepLog(label, ms) {
+        console.log(`[YamatoFix] ⏱ 待機: ${label} ${ms}ms`);
+        return sleep(ms);
+    }
+
     // ── セレクタが現れるまで最大 timeoutMs 待機（main + 全 iframe を監視）──
     async function waitFor(selector, timeoutMs = TIMING.waitForTimeout) {
         const deadline = Date.now() + timeoutMs;
@@ -161,7 +166,7 @@
                 }
             }
 
-            await sleep(TIMING.waitForPoll);
+            await sleepLog('waitForPoll', TIMING.waitForPoll);
         }
         console.warn('[YamatoFix] waitFor タイムアウト:', selector);
         return null;
@@ -235,65 +240,86 @@
     async function processRow(editBtn) {
         editBtn.click();
 
-        // モーダルが開くまで #consignee_address03 が出現するのを最大8秒待つ
         const machiInput = await waitFor('#consignee_address03');
-        if (!machiInput) throw new Error('町・番地フィールドが見つかりません（タイムアウト）');
+        if (!machiInput) throw new Error('フォームが見つかりません（タイムアウト）');
 
-        // is_error クラスがなければ町・番地以外のエラー → スキップ
-        if (!machiInput.classList.contains('is_error')) {
-            throw new Error('町・番地の is_error なし（別フィールドのエラーのためスキップ）');
-        }
-
-        const addr = machiInput.value;
-        if (fwLen(addr) <= LIMIT.machi) {
-            throw new Error(`町・番地は制限内（別のエラー？）: "${addr}"`);
-        }
-
-        // 番地部分とマンション名部分に分割
-        const [street, building] = splitAtBuilding(addr);
-        console.log('[YamatoFix] 分割結果:', { street, building });
-
-        if (fwLen(street) > LIMIT.machi) {
-            throw new Error(`番地部分だけで16文字超（自動修正不可）: "${street}"`);
-        }
-
-        // 町・番地 をセット
-        setVal(machiInput, street);
-
-        // 他のフィールドも同じ document（iframe or main）から取得
         const mDoc = machiInput.ownerDocument;
-        let rem = building;
+        let anyFixed = false;
 
-        // マンション・ビル名（id="consignee_address04"、最大16文字）
-        if (rem) {
-            const inp = mDoc.getElementById('consignee_address04');
-            if (!inp) throw new Error('マンション・ビル名フィールドが見つかりません');
-            const [val, rest] = fwSplit(rem, LIMIT.mansion);
-            setVal(inp, val);
-            rem = rest;
+        // ── お届け先 町・番地（#consignee_address03）──
+        if (machiInput.classList.contains('is_error')) {
+            const addr = machiInput.value;
+            if (fwLen(addr) <= LIMIT.machi) {
+                throw new Error(`お届け先 町・番地は制限内（別のエラー？）: "${addr}"`);
+            }
+
+            const [street, building] = splitAtBuilding(addr);
+            console.log('[YamatoFix] お届け先 分割結果:', { street, building });
+
+            if (fwLen(street) > LIMIT.machi) {
+                throw new Error(`お届け先 番地部分だけで16文字超（自動修正不可）: "${street}"`);
+            }
+
+            setVal(machiInput, street);
+            let rem = building;
+
+            if (rem) {
+                const inp = mDoc.getElementById('consignee_address04');
+                if (!inp) throw new Error('お届け先 マンション・ビル名フィールドが見つかりません');
+                const [val, rest] = fwSplit(rem, LIMIT.mansion);
+                setVal(inp, val);
+                rem = rest;
+            }
+            if (rem) {
+                const inp = mDoc.querySelector('[name="consignee_department1"]');
+                if (!inp) throw new Error('お届け先 会社・部門１フィールドが見つかりません');
+                const [val, rest] = fwSplit(rem, LIMIT.kaisha1);
+                setVal(inp, val);
+                rem = rest;
+            }
+            if (rem) {
+                const inp = mDoc.querySelector('[name="consignee_department2"]');
+                if (!inp) throw new Error('お届け先 会社・部門２フィールドが見つかりません');
+                const [val, rest] = fwSplit(rem, LIMIT.kaisha2);
+                setVal(inp, val);
+                rem = rest;
+            }
+            if (rem) throw new Error(`お届け先 全フィールドに収まりません（残り: "${rem}"）`);
+
+            anyFixed = true;
         }
 
-        // 会社・部門１（name="consignee_department1"、最大25文字）
-        if (rem) {
-            const inp = mDoc.querySelector('[name="consignee_department1"]');
-            if (!inp) throw new Error('会社・部門１フィールドが見つかりません');
-            const [val, rest] = fwSplit(rem, LIMIT.kaisha1);
-            setVal(inp, val);
-            rem = rest;
+        // ── ご依頼主 町・番地（#shipper_address3）──
+        const shipperMachi = mDoc.getElementById('shipper_address3');
+        if (shipperMachi && shipperMachi.classList.contains('is_error')) {
+            const addr = shipperMachi.value;
+            if (fwLen(addr) <= LIMIT.machi) {
+                throw new Error(`ご依頼主 町・番地は制限内（別のエラー？）: "${addr}"`);
+            }
+
+            const [street, building] = splitAtBuilding(addr);
+            console.log('[YamatoFix] ご依頼主 分割結果:', { street, building });
+
+            if (fwLen(street) > LIMIT.machi) {
+                throw new Error(`ご依頼主 番地部分だけで16文字超（自動修正不可）: "${street}"`);
+            }
+
+            setVal(shipperMachi, street);
+
+            if (building) {
+                const inp = mDoc.querySelector('[name="shipper_address4"]');
+                if (!inp) throw new Error('ご依頼主 マンション・ビル名フィールドが見つかりません');
+                const [val, rest] = fwSplit(building, LIMIT.mansion);
+                setVal(inp, val);
+                if (rest) throw new Error(`ご依頼主 全フィールドに収まりません（残り: "${rest}"）`);
+            }
+
+            anyFixed = true;
         }
 
-        // 会社・部門２（name="consignee_department2"、最大25文字）
-        if (rem) {
-            const inp = mDoc.querySelector('[name="consignee_department2"]');
-            if (!inp) throw new Error('会社・部門２フィールドが見つかりません');
-            const [val, rest] = fwSplit(rem, LIMIT.kaisha2);
-            setVal(inp, val);
-            rem = rest;
-        }
+        if (!anyFixed) throw new Error('自動修正可能なエラーがありません（is_error なし）');
 
-        if (rem) throw new Error(`全フィールドに収まりません（残り: "${rem}"）`);
-
-        await sleep(TIMING.beforeUpdate);
+        await sleepLog('beforeUpdate', TIMING.beforeUpdate);
 
         // 更新ボタン（id="Edit"）をクリック
         const updateBtn = mDoc.getElementById('Edit');
@@ -302,8 +328,13 @@
         autoOK = true;
         updateBtn.click();
         // confirm（よろしいですか？）と alert（更新しました）を自動OK
-        await sleep(TIMING.afterUpdate);
+        await sleepLog('afterUpdate', TIMING.afterUpdate);
         autoOK = false;
+
+        // 更新後もモーダルが残っていれば更新失敗と判断 → throw してスキップ処理へ
+        if (mDoc.getElementById('Edit')) {
+            throw new Error('更新後もモーダルが閉じませんでした（サーバーエラーまたは入力不備）');
+        }
     }
 
     // =====================================================================
@@ -326,10 +357,10 @@
 
         if (closeBtn) {
             closeBtn.click();
-            await sleep(TIMING.afterClose);
+            await sleepLog('afterClose', TIMING.afterClose);
         }
         autoOK = false;
-        await sleep(TIMING.afterCloseExtra);
+        await sleepLog('afterCloseExtra', TIMING.afterCloseExtra);
     }
 
     // =====================================================================
@@ -371,7 +402,7 @@
         const vp = getViewport();
         if (vp && vp.scrollTop !== 0) {
             vp.scrollTop = 0;
-            await sleep(TIMING.scrollReset);
+            await sleepLog('scrollReset', TIMING.scrollReset);
         }
     }
 
@@ -388,7 +419,7 @@
 
         // 毎回トップから走査
         vp.scrollTop = 0;
-        await sleep(TIMING.scrollReset);
+        await sleepLog('scrollReset', TIMING.scrollReset);
 
         const step = Math.max(SCROLL.stepMinPx, Math.floor(vp.clientHeight * SCROLL.stepRatio));
 
@@ -400,7 +431,7 @@
             if (vp.scrollTop >= maxScroll) break;  // 末尾まで到達
 
             vp.scrollTop = Math.min(vp.scrollTop + step, maxScroll);
-            await sleep(TIMING.scrollStep);
+            await sleepLog('scrollStep', TIMING.scrollStep);
 
             if (onScroll) onScroll(vp.scrollTop, maxScroll);
         }
@@ -464,7 +495,7 @@
             }
 
             // 処理後はスクロールをトップに戻してから再スキャン
-            await sleep(TIMING.afterRow);
+            await sleepLog('afterRow', TIMING.afterRow);
             await resetScroll();
         }
 
