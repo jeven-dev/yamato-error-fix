@@ -20,6 +20,25 @@
         kaisha2: 25,   // 会社・部門２
     };
 
+    // ── タイミング設定（ms）──
+    const TIMING = {
+        waitForTimeout:  15000,  // waitFor の最大待機時間
+        waitForPoll:       300,  // waitFor のポーリング間隔
+        beforeUpdate:      600,  // 更新ボタンクリック前の待機
+        afterUpdate:      3500,  // 更新ボタンクリック後の待機（confirm + alert を自動OK する余裕）
+        afterClose:       1500,  // 閉じるボタンクリック後の待機
+        afterCloseExtra:   600,  // tryClose 完了後の追加待機
+        scrollReset:       400,  // スクロールリセット後の待機
+        scrollStep:        350,  // スクロール1ステップ後の待機
+        afterRow:         1200,  // 1行処理完了後の待機
+    };
+
+    // ── スクロール設定 ──
+    const SCROLL = {
+        stepRatio:  0.6,   // 1回のスクロール量（ビューポート高さに対する割合）
+        stepMinPx:   80,   // 1回のスクロール最小量（px）
+    };
+
     // =====================================================================
     // 文字幅ユーティリティ（全角=1、半角=0.5）
     // =====================================================================
@@ -98,11 +117,14 @@
     // =====================================================================
     // DOM ユーティリティ
     // =====================================================================
+
+    // iframe 内の要素にも対応：ownerDocument の window プロトタイプを使う
     function setVal(input, val) {
         if (!input) return;
+        const win = input.ownerDocument.defaultView || window;
         const proto = input.tagName === 'TEXTAREA'
-            ? window.HTMLTextAreaElement.prototype
-            : window.HTMLInputElement.prototype;
+            ? win.HTMLTextAreaElement.prototype
+            : win.HTMLInputElement.prototype;
         Object.getOwnPropertyDescriptor(proto, 'value').set.call(input, val);
         ['input', 'change', 'blur'].forEach(t =>
             input.dispatchEvent(new Event(t, { bubbles: true }))
@@ -113,174 +135,114 @@
         return new Promise(r => setTimeout(r, ms));
     }
 
-    // ── ラベルテキストで input を探す ──
-    function findInputByLabel(labelText) {
-        const normalized = labelText.replace(/\s/g, '');
-        const cells = document.querySelectorAll(
-            'th, td, label, dt, .form-label, .label, [class*="label"]'
-        );
-        for (const cell of cells) {
-            const text = (cell.innerText || cell.textContent || '').replace(/\s/g, '');
-            if (!text.includes(normalized)) continue;
+    // ── セレクタが現れるまで最大 timeoutMs 待機（main + 全 iframe を監視）──
+    async function waitFor(selector, timeoutMs = TIMING.waitForTimeout) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            // メイン document を確認
+            const inMain = document.querySelector(selector);
+            if (inMain) return inMain;
 
-            // 同じ tr 内の input
-            const tr = cell.closest('tr');
-            if (tr) {
-                const inp = tr.querySelector(
-                    'input[type="text"], ' +
-                    'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])' +
-                    ':not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="file"])'
-                );
-                if (inp) return inp;
+            // 全 iframe を確認（readyState チェックなし：loading 中でも要素があれば取得）
+            for (const iframe of document.querySelectorAll('iframe')) {
+                try {
+                    const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                    if (!doc) continue;
+                    const el = doc.querySelector(selector);
+                    if (el) {
+                        console.log('[YamatoFix] iframe 内で要素を検出:', selector);
+                        return el;
+                    }
+                } catch (e) {
+                    if (!iframe.__yfErrLogged) {
+                        iframe.__yfErrLogged = true;
+                        console.warn('[YamatoFix] iframe アクセスエラー:', e.message);
+                    }
+                }
             }
 
-            // 次の兄弟要素内の input
-            let sib = cell.nextElementSibling;
-            while (sib) {
-                const inp = sib.querySelector?.('input[type="text"], input:not([type="hidden"]), textarea') ||
-                            (sib.matches?.('input, textarea') ? sib : null);
-                if (inp) return inp;
-                sib = sib.nextElementSibling;
-            }
+            await sleep(TIMING.waitForPoll);
         }
+        console.warn('[YamatoFix] waitFor タイムアウト:', selector);
         return null;
     }
 
-    // ── テキストでボタンを探す（モーダル内を優先）──
-    function findBtn(text) {
-        const all = [...document.querySelectorAll(
-            'button, input[type="button"], input[type="submit"], a.btn, a[class*="btn"]'
-        )];
-        const matched = all.filter(el =>
-            (el.textContent || el.value || '').trim().includes(text) &&
-            el.offsetParent !== null   // visible check
-        );
-        // モーダル内のボタンを優先
-        for (const el of matched) {
-            if (el.closest(
-                '.modal, .modal-content, .overlay, .dialog, [role="dialog"], ' +
-                '[class*="modal"], [class*="overlay"], [class*="popup"]'
-            )) return el;
-        }
-        return matched[matched.length - 1] || null;
-    }
-
     // =====================================================================
-    // エラー行（赤背景）の検出
+    // エラー行の編集ボタンを収集
+    // hasError クラスを持つ slick-cell を含む slick-row を対象とする
     // =====================================================================
-    function isRed(colorStr) {
-        const m = (colorStr || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-        if (!m) return false;
-        const [r, g, b] = [+m[1], +m[2], +m[3]];
-        return r > 150 && g < 120 && b < 120 && (r - g) > 50 && (r - b) > 50;
-    }
-
-    function findErrorEditButtons() {
+    function findErrorEditButtons(skippedRowTops = new Set()) {
         const result = [];
-        for (const tr of document.querySelectorAll('tr')) {
-            const cells = [...tr.querySelectorAll('td')];
-            if (!cells.length) continue;
+        const seenRows = new Set();
 
-            const rowRed   = isRed(getComputedStyle(tr).backgroundColor);
-            const cellRed  = cells.some(td =>
-                isRed(getComputedStyle(td).backgroundColor) ||
-                isRed(td.style.backgroundColor)
-            );
-            const classRed = /error|danger|red|invalid/i.test(tr.className + ' ' + tr.id);
+        for (const cell of document.querySelectorAll('.slick-cell.hasError')) {
+            const row = cell.closest('.slick-row');
+            if (!row || seenRows.has(row)) continue;
+            seenRows.add(row);
 
-            if (!(rowRed || cellRed || classRed)) continue;
+            const rowTop = row.style.top;
+            if (skippedRowTops.has(rowTop)) continue;
 
-            const btn = [...tr.querySelectorAll('button, a, input[type="button"]')]
-                .find(b => (b.textContent || b.value || '').includes('編集'));
-            if (btn) result.push(btn);
+            const btn = row.querySelector('#editSaveIssue');
+            if (btn) result.push({ btn, rowTop });
         }
         return result;
     }
 
     // =====================================================================
-    // テーブルのスクロールコンテナを探す
-    // =====================================================================
-    function findTableScrollContainer() {
-        // テーブル要素を起点に、overflow: scroll/auto の祖先を探す
-        const tables = document.querySelectorAll('table');
-        for (const table of tables) {
-            let el = table.parentElement;
-            while (el && el !== document.body && el !== document.documentElement) {
-                const st = getComputedStyle(el);
-                if (st.overflowY === 'scroll' || st.overflowY === 'auto') {
-                    // スクロール可能な高さがあるか確認
-                    if (el.scrollHeight > el.clientHeight + 10) return el;
-                }
-                el = el.parentElement;
-            }
-        }
-        // フォールバック: ページ自体をスクロール
-        return document.documentElement.scrollHeight > document.documentElement.clientHeight + 10
-            ? document.documentElement
-            : null;
-    }
-
-    // =====================================================================
-    // スクロールしながら最初の赤行の編集ボタンを探す
-    // =====================================================================
-    async function findFirstErrorWithScroll() {
-        const container = findTableScrollContainer();
-
-        // コンテナが見つからない or スクロール不要 → DOM全体を直接検索
-        if (!container) {
-            const btns = findErrorEditButtons();
-            return btns[0] || null;
-        }
-
-        // 先頭に戻ってからスキャン開始
-        container.scrollTop = 0;
-        await sleep(400);
-
-        while (true) {
-            const btns = findErrorEditButtons();
-            if (btns.length > 0) {
-                // 見つかったボタンをビューに収める
-                btns[0].scrollIntoView({ block: 'center', behavior: 'smooth' });
-                await sleep(400);
-                return btns[0];
-            }
-
-            // 1画面分スクロールダウン
-            const prev = container.scrollTop;
-            container.scrollTop += Math.max(container.clientHeight * 0.8, 200);
-            await sleep(400);
-
-            // これ以上スクロールできなければ終了
-            if (container.scrollTop <= prev) break;
-        }
-
-        return null;
-    }
-
-    // =====================================================================
-    // native alert / confirm のインターセプト
+    // alert / confirm のインターセプト
+    // メインページ＋動的に追加される iframe の両方をパッチ
     // =====================================================================
     let autoOK = false;
-    const _confirm = window.confirm.bind(window);
-    const _alert   = window.alert.bind(window);
-    window.confirm = (...a) => {
-        if (autoOK) { console.log('[YamatoFix] confirm → OK:', ...a); return true; }
-        return _confirm(...a);
-    };
-    window.alert = (...a) => {
-        if (autoOK) { console.log('[YamatoFix] alert → OK:', ...a); return; }
-        return _alert(...a);
-    };
+
+    function patchDialogs(win) {
+        if (!win || win.__yfPatched) return;
+        try {
+            win.__yfPatched = true;
+            const oc = win.confirm.bind(win);
+            const oa = win.alert.bind(win);
+            win.confirm = (...a) => {
+                if (autoOK) { console.log('[YamatoFix] confirm → OK:', ...a); return true; }
+                return oc(...a);
+            };
+            win.alert = (...a) => {
+                if (autoOK) { console.log('[YamatoFix] alert → OK:', ...a); return; }
+                return oa(...a);
+            };
+        } catch (e) { /* cross-origin は無視 */ }
+    }
+
+    // メインウィンドウをパッチ
+    patchDialogs(window);
+
+    // iframe が追加されたら即パッチ（FancyBox が動的に生成する iframe に対応）
+    new MutationObserver(() => {
+        document.querySelectorAll('iframe').forEach(iframe => {
+            if (iframe.__yfIframePatchStarted) return;
+            iframe.__yfIframePatchStarted = true;
+            // すでに読み込まれている場合
+            try { patchDialogs(iframe.contentWindow); } catch (e) {}
+            // load イベントでも再パッチ（読み込み完了後に window が確定するため）
+            iframe.addEventListener('load', () => {
+                try { patchDialogs(iframe.contentWindow); } catch (e) {}
+            });
+        });
+    }).observe(document.body, { childList: true, subtree: true });
 
     // =====================================================================
     // 1行分の修正処理
     // =====================================================================
     async function processRow(editBtn) {
         editBtn.click();
-        await sleep(1800);
 
-        const machiInput = findInputByLabel('町・番地');
-        if (!machiInput) throw new Error('町・番地フィールドが見つかりません');
+        // モーダルが開くまで #consignee_address03 が出現するのを最大8秒待つ
+        const machiInput = await waitFor('#consignee_address03');
+        if (!machiInput) throw new Error('町・番地フィールドが見つかりません（タイムアウト）');
+
+        // is_error クラスがなければ町・番地以外のエラー → スキップ
+        if (!machiInput.classList.contains('is_error')) {
+            throw new Error('町・番地の is_error なし（別フィールドのエラーのためスキップ）');
+        }
 
         const addr = machiInput.value;
         if (fwLen(addr) <= LIMIT.machi) {
@@ -298,53 +260,49 @@
         // 町・番地 をセット
         setVal(machiInput, street);
 
+        // 他のフィールドも同じ document（iframe or main）から取得
+        const mDoc = machiInput.ownerDocument;
         let rem = building;
 
-        // マンション・ビル名（最大16文字）
+        // マンション・ビル名（id="consignee_address04"、最大16文字）
         if (rem) {
-            const inp = findInputByLabel('マンション・ビル名') ||
-                        findInputByLabel('マンション') ||
-                        findInputByLabel('ビル名');
+            const inp = mDoc.getElementById('consignee_address04');
             if (!inp) throw new Error('マンション・ビル名フィールドが見つかりません');
             const [val, rest] = fwSplit(rem, LIMIT.mansion);
             setVal(inp, val);
             rem = rest;
         }
 
-        // 会社・部門１（最大25文字）
+        // 会社・部門１（name="consignee_department1"、最大25文字）
         if (rem) {
-            const inp = findInputByLabel('会社・部門１') ||
-                        findInputByLabel('会社・部門1');
+            const inp = mDoc.querySelector('[name="consignee_department1"]');
             if (!inp) throw new Error('会社・部門１フィールドが見つかりません');
             const [val, rest] = fwSplit(rem, LIMIT.kaisha1);
             setVal(inp, val);
             rem = rest;
         }
 
-        // 会社・部門２（最大25文字）
+        // 会社・部門２（name="consignee_department2"、最大25文字）
         if (rem) {
-            const inp = findInputByLabel('会社・部門２') ||
-                        findInputByLabel('会社・部門2');
+            const inp = mDoc.querySelector('[name="consignee_department2"]');
             if (!inp) throw new Error('会社・部門２フィールドが見つかりません');
             const [val, rest] = fwSplit(rem, LIMIT.kaisha2);
             setVal(inp, val);
             rem = rest;
         }
 
-        if (rem) {
-            throw new Error(`全フィールドに収まりません（残り: "${rem}"）`);
-        }
+        if (rem) throw new Error(`全フィールドに収まりません（残り: "${rem}"）`);
 
-        await sleep(600);
+        await sleep(TIMING.beforeUpdate);
 
-        // 更新ボタンをクリック
-        const updateBtn = findBtn('更新');
-        if (!updateBtn) throw new Error('更新ボタンが見つかりません');
+        // 更新ボタン（id="Edit"）をクリック
+        const updateBtn = mDoc.getElementById('Edit');
+        if (!updateBtn) throw new Error('更新ボタンが見つかりません（id="Edit"）');
 
         autoOK = true;
         updateBtn.click();
         // confirm（よろしいですか？）と alert（更新しました）を自動OK
-        await sleep(3500);
+        await sleep(TIMING.afterUpdate);
         autoOK = false;
     }
 
@@ -353,13 +311,25 @@
     // =====================================================================
     async function tryClose() {
         autoOK = true;
-        const btn = findBtn('閉じる');
-        if (btn) {
-            btn.click();
-            await sleep(1500);
+        // 閉じるボタン（id="closeWindow1"）を iframe 内から探す
+        let closeBtn = null;
+        for (const iframe of document.querySelectorAll('iframe')) {
+            try {
+                const doc = iframe.contentDocument || iframe.contentWindow?.document;
+                if (!doc) continue;
+                closeBtn = doc.getElementById('closeWindow1');
+                if (closeBtn) break;
+            } catch (e) { /* ignore */ }
+        }
+        // iframe になければ main document を確認
+        if (!closeBtn) closeBtn = document.getElementById('closeWindow1');
+
+        if (closeBtn) {
+            closeBtn.click();
+            await sleep(TIMING.afterClose);
         }
         autoOK = false;
-        await sleep(600);
+        await sleep(TIMING.afterCloseExtra);
     }
 
     // =====================================================================
@@ -384,43 +354,124 @@
     }
 
     // =====================================================================
+    // SlickGrid スクロール対応：トップから末尾まで走査して赤行を探す
+    // =====================================================================
+
+    // SlickGrid のスクロール可能なビューポートを取得
+    function getViewport() {
+        return (
+            document.querySelector('.slick-viewport-top.slick-viewport-right') ||
+            document.querySelector('.slick-viewport-top') ||
+            document.querySelector('.slick-viewport')
+        );
+    }
+
+    // ビューポートをトップにリセット
+    async function resetScroll() {
+        const vp = getViewport();
+        if (vp && vp.scrollTop !== 0) {
+            vp.scrollTop = 0;
+            await sleep(TIMING.scrollReset);
+        }
+    }
+
+    // トップ→末尾へスクロールしながら赤行の編集ボタンを1件返す
+    // 見つからなければ null を返す（全件スキャン済み = エラーなし）
+    async function scrollAndFindError(skippedRowTops, onScroll) {
+        const vp = getViewport();
+
+        // SlickGrid が存在しない場合は現在の DOM だけ検索
+        if (!vp) {
+            const btns = findErrorEditButtons(skippedRowTops);
+            return btns[0] || null;
+        }
+
+        // 毎回トップから走査
+        vp.scrollTop = 0;
+        await sleep(TIMING.scrollReset);
+
+        const step = Math.max(SCROLL.stepMinPx, Math.floor(vp.clientHeight * SCROLL.stepRatio));
+
+        while (true) {
+            const btns = findErrorEditButtons(skippedRowTops);
+            if (btns.length > 0) return btns[0];
+
+            const maxScroll = vp.scrollHeight - vp.clientHeight;
+            if (vp.scrollTop >= maxScroll) break;  // 末尾まで到達
+
+            vp.scrollTop = Math.min(vp.scrollTop + step, maxScroll);
+            await sleep(TIMING.scrollStep);
+
+            if (onScroll) onScroll(vp.scrollTop, maxScroll);
+        }
+
+        // 末尾での最終チェック
+        const btns = findErrorEditButtons(skippedRowTops);
+        return btns[0] || null;
+    }
+
+    // =====================================================================
     // メインループ
     // =====================================================================
     async function run() {
-        let fixed = 0, skipped = 0;
+        // 修正必要件数を取得してループ上限を決定
+        const numEl = document.getElementById('num_of_error');
+        const totalCount = numEl ? parseInt(numEl.textContent) : NaN;
+        if (isNaN(totalCount)) {
+            showStatus('⚠️ 修正必要件数が取得できません', '#e74c3c');
+            return;
+        }
+        if (totalCount === 0) {
+            showStatus('✅ 修正が必要な件数は0件です', '#27ae60');
+            return;
+        }
 
-        while (true) {
+        let fixed = 0, skipped = 0;
+        const skippedRowTops = new Set();  // スキップ済み行の style.top を記録（重複実行防止）
+
+        while (fixed + skipped < totalCount) {
             showStatus(
-                `🔍 エラー行を探しています...<br>` +
-                `修正済: <b>${fixed}</b> 件 ／ スキップ: <b>${skipped}</b> 件`
+                `🔍 エラー行を検索中...<br>` +
+                `修正済: <b>${fixed}</b> ／ スキップ: <b>${skipped}</b> ／ 合計: <b>${totalCount}</b> 件`
             );
 
-            // スクロールしながら最初のエラー行を探す
-            const editBtn = await findFirstErrorWithScroll();
-            if (!editBtn) break;
+            const found = await scrollAndFindError(skippedRowTops, (pos, max) => {
+                const pct = Math.round((pos / max) * 100);
+                showStatus(
+                    `🔍 スクロール検索中 ${pct}%...<br>` +
+                    `修正済: <b>${fixed}</b> ／ スキップ: <b>${skipped}</b> ／ 合計: <b>${totalCount}</b> 件`
+                );
+            });
+
+            if (!found) break;  // スキップ済み以外のエラー行がなくなった
+
+            const { btn: editBtn, rowTop } = found;
 
             showStatus(
-                `🔄 処理中...<br>` +
-                `修正済: <b>${fixed}</b> 件 ／ スキップ: <b>${skipped}</b> 件`
+                `🔄 修正中...<br>` +
+                `修正済: <b>${fixed}</b> ／ スキップ: <b>${skipped}</b> ／ 合計: <b>${totalCount}</b> 件`
             );
 
             try {
                 await processRow(editBtn);
                 fixed++;
-                console.log(`[YamatoFix] 修正完了 (合計 ${fixed} 件)`);
+                console.log(`[YamatoFix] 修正完了 (${fixed}/${totalCount})`);
             } catch (err) {
                 console.warn('[YamatoFix] スキップ:', err.message);
                 skipped++;
+                skippedRowTops.add(rowTop);
                 await tryClose();
             }
 
-            await sleep(1500);
+            // 処理後はスクロールをトップに戻してから再スキャン
+            await sleep(TIMING.afterRow);
+            await resetScroll();
         }
 
         const allDone = skipped === 0;
         showStatus(
             `✅ 処理完了！<br>` +
-            `修正: <b>${fixed}</b> 件 ／ スキップ: <b>${skipped}</b> 件` +
+            `修正: <b>${fixed}</b> 件 ／ スキップ: <b>${skipped}</b> 件 ／ 合計: <b>${totalCount}</b> 件` +
             (skipped > 0 ? '<br><small>スキップされた行は手動で確認してください。</small>' : ''),
             allDone ? '#27ae60' : '#c0392b'
         );
@@ -430,8 +481,7 @@
     // 起動ボタンを追加（対象ページのみ）
     // =====================================================================
     function isTargetPage() {
-        const body = document.body?.textContent || '';
-        return body.includes('修正必要件数') || body.includes('取込み結果');
+        return location.pathname === '/importapi.html';
     }
 
     function addStartButton() {
